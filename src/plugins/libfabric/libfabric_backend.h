@@ -310,6 +310,7 @@ private:
                         int end_idx,
                         int desc_count,
                         size_t xfer_base_offset,
+                        bool allow_fi_more,
                         size_t &submitted_count) const;
 
 #ifdef HAVE_CUDA

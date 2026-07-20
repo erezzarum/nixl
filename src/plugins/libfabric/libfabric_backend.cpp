@@ -1116,6 +1116,7 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
                                          int end_idx,
                                          int desc_count,
                                          size_t xfer_base_offset,
+                                         bool allow_fi_more,
                                          size_t &submitted_count) const {
     submitted_count = 0;
 
@@ -1146,6 +1147,39 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
         return NIXL_SUCCESS;
     };
 #endif
+
+    // A FI_MORE post rings no doorbell; a rail's queued batch is only submitted by a later
+    // non-FI_MORE post on the same rail. Rails are resolved per-buffer, so descriptors of one
+    // round-robin group can land on different rails: every rail this chunk touches must have its
+    // last post flushed (apply_fi_more = false), or its batch would never be submitted.
+    // allow_fi_more is false on the thread-pool path: chunks on other threads can interleave
+    // posts on the same rail, so a per-chunk walk cannot know a rail's true last post there.
+    std::vector<uint8_t> apply_fi_more((size_t)desc_count, 0); // indexed by desc_idx; default flush
+    if (allow_fi_more && op_type == nixlLibfabricReq::WRITE) {
+        std::vector<int> posts_since_flush(rail_manager_.getNumRails(), -1);
+        for (int i = end_idx - 1; i >= start_idx; --i) {
+            auto *md = static_cast<nixlLibfabricPrivateMetadata *>(local[i].metadataP);
+            if (!md || md->selected_rails_.empty()) {
+                continue;
+            }
+            // Striped descriptors (same condition as use_striping in prepareAndSubmitTransfer)
+            // are split across their rails and posted without FI_MORE, so they are not part of
+            // the single-rail batching this loop tracks.
+            if (rail_manager_.shouldUseStriping(local[i].len) && md->selected_rails_.size() > 1) {
+                continue;
+            }
+            const size_t rail_sel_idx = nixlLibfabricRailManager::railSelectionIndex(
+                xfer_base_offset, i, /*batch_write=*/true, md->selected_rails_.size());
+            const size_t rail_id = md->selected_rails_[rail_sel_idx];
+            int &seen = posts_since_flush[rail_id];
+            if (seen < 0 || seen >= NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE - 1) {
+                seen = 0;
+            } else {
+                apply_fi_more[(size_t)i] = 1;
+                ++seen;
+            }
+        }
+    }
 
     for (int desc_idx = start_idx; desc_idx < end_idx; ++desc_idx) {
         auto *local_md = static_cast<nixlLibfabricPrivateMetadata *>(local[desc_idx].metadataP);
@@ -1182,8 +1216,8 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
             [backend_handle]() { backend_handle->increment_completed_requests(); },
             desc_submitted_count,
             desc_idx,
-            desc_count,
-            xfer_base_offset);
+            xfer_base_offset,
+            (bool)apply_fi_more[(size_t)desc_idx]);
 
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "prepareAndSubmitTransfer failed for descriptor " << desc_idx
@@ -1296,6 +1330,7 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
                                                    desc_count,
                                                    desc_count,
                                                    xfer_base_offset,
+                                                   /*allow_fi_more=*/true,
                                                    total_submitted);
         if (status != NIXL_SUCCESS) {
             return status;
@@ -1329,6 +1364,7 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
                                                      end_idx,
                                                      desc_count,
                                                      xfer_base_offset,
+                                                     /*allow_fi_more=*/false,
                                                      chunk_submitted);
                     }
                     catch (const std::exception &e) {
