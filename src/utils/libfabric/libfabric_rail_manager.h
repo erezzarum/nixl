@@ -132,6 +132,17 @@ public:
         return rails_.size();
     }
 
+    /** Round-robin index of a descriptor into a selection array of `count` entries.
+     * batch_write groups NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE consecutive descriptors per entry.
+     * The FI_MORE flush precompute and the rail selection must agree, so both call this. */
+    static size_t
+    railSelectionIndex(size_t base_offset, int desc_idx, bool batch_write, size_t count) {
+        const size_t rr_idx = batch_write ?
+            (base_offset + static_cast<size_t>(desc_idx) / NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE) :
+            (base_offset + static_cast<size_t>(desc_idx));
+        return rr_idx % count;
+    }
+
     // Memory registration management
     /** Register memory with topology-aware rail selection based on memory type and location
      * @param buffer Memory buffer to register
@@ -198,8 +209,11 @@ public:
      * @param completion_callback Callback for completion notification
      * @param submitted_count_out Number of requests successfully submitted
      * @param desc_idx Index of current descriptor within the transfer
-     * @param desc_count Total number of descriptors in the transfer
      * @param base_offset Pre-reserved round-robin offset from reserveBaseOffset()
+     * @param apply_fi_more Precomputed by the caller: true keeps a non-striped WRITE batched
+     *        (posted with FI_MORE); false flushes the rail's batch. The caller passes false for
+     *        a rail's last post and when a batch reaches NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE.
+     *        Defaults to false so an unmarked descriptor flushes safely.
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
@@ -218,8 +232,8 @@ public:
                              std::function<void()> completion_callback,
                              size_t &submitted_count_out,
                              int desc_idx,
-                             int desc_count,
-                             size_t base_offset);
+                             size_t base_offset,
+                             bool apply_fi_more = false);
 
     /** Reserve a base offset for a transfer to ensure stable rail assignment
      *  across all descriptors in the transfer. Call once per postXfer. */

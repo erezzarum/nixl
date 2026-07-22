@@ -1031,6 +1031,56 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
     // Core transfer submission to process each descriptor with direct submission
     // Reserve base_offset once per transfer so all descriptors see a stable rail assignment
     const size_t xfer_base_offset = rail_manager.reserveBaseOffset();
+
+    // A FI_MORE post rings no doorbell; a rail's queued batch is only submitted by a later
+    // non-FI_MORE post on the same rail. Rails are resolved per-buffer, so descriptors of one
+    // round-robin group can land on different rails: every rail this transfer touches must have
+    // its last post flushed, or its batch would never be submitted.
+    const bool batch_writes = (op_type == nixlLibfabricReq::WRITE);
+
+    // Rail of a single-rail WRITE descriptor, or -1 if it does not participate in batching.
+    auto batching_rail = [&](int i) -> int {
+        auto *md = static_cast<nixlLibfabricPrivateMetadata *>(local[i].metadataP);
+        if (!md || md->selected_rails_.empty()) {
+            return -1;
+        }
+        // Striped descriptors (same condition as use_striping in prepareAndSubmitTransfer)
+        // are split across their rails and posted without FI_MORE, so they are not part of
+        // the single-rail batching tracked here.
+        if (rail_manager.shouldUseStriping(local[i].len) && md->selected_rails_.size() > 1) {
+            return -1;
+        }
+        return (int)md->selected_rails_[nixlLibfabricRailManager::railSelectionIndex(
+            xfer_base_offset, i, /*batch_write=*/true, md->selected_rails_.size())];
+    };
+
+    std::vector<int> last_desc_idx_per_rail(rail_manager.getNumRails(), -1);
+    std::vector<int> posts_since_flush(rail_manager.getNumRails(), 0);
+    if (batch_writes) {
+        for (int i = 0; i < desc_count; ++i) {
+            const int rail_id = batching_rail(i);
+            if (rail_id >= 0) {
+                last_desc_idx_per_rail[rail_id] = i;
+            }
+        }
+    }
+
+    // True if descriptor i should carry FI_MORE: not its rail's last post in this transfer and the
+    // rail's running batch is below NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE; otherwise it flushes.
+    auto use_fi_more = [&](int i) -> bool {
+        const int rail_id = batch_writes ? batching_rail(i) : -1;
+        if (rail_id < 0) {
+            return false;
+        }
+        if (i == last_desc_idx_per_rail[rail_id] ||
+            posts_since_flush[rail_id] >= NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE - 1) {
+            posts_since_flush[rail_id] = 0;
+            return false;
+        }
+        ++posts_since_flush[rail_id];
+        return true;
+    };
+
     for (int desc_idx = 0; desc_idx < desc_count; ++desc_idx) {
         auto *local_md = static_cast<nixlLibfabricPrivateMetadata *>(local[desc_idx].metadataP);
         auto *remote_md = static_cast<nixlLibfabricPublicMetadata *>(remote[desc_idx].metadataP);
@@ -1062,6 +1112,8 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
 
         uint64_t remote_registered_base = remote_md->remote_buf_addr_;
 
+        const bool apply_fi_more = use_fi_more(desc_idx);
+
         size_t submitted_count = 0;
         nixl_status_t status = rail_manager.prepareAndSubmitTransfer(
             op_type,
@@ -1081,8 +1133,8 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
             }, // Completion callback
             submitted_count,
             desc_idx,
-            desc_count,
-            xfer_base_offset);
+            xfer_base_offset,
+            apply_fi_more);
 
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "prepareAndSubmitTransfer failed for descriptor " << desc_idx
